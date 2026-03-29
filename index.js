@@ -485,7 +485,7 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── Streamable HTTP endpoint (POST /mcp) ────────────
+  // ── Streamable HTTP endpoint ─────────────────────────
   if (url.pathname === "/mcp") {
     const c = config();
     if (c.needsAuth) {
@@ -494,54 +494,54 @@ const httpServer = http.createServer(async (req, res) => {
       return;
     }
 
-    if (req.method === "POST") {
-      const sessionId = req.headers["mcp-session-id"];
+    const sessionId = req.headers["mcp-session-id"];
 
+    if (req.method === "POST") {
       // Existing session
       if (sessionId && streamTransports.has(sessionId)) {
-        const transport = streamTransports.get(sessionId);
-        await transport.handleRequest(req, res);
+        await streamTransports.get(sessionId).handleRequest(req, res);
         return;
       }
 
-      // New session - create transport and server
+      // New session
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID() });
       const server = new Server({ name: "google-ads-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
       setupHandlers(server);
-
-      transport.onclose = () => {
-        if (transport.sessionId) streamTransports.delete(transport.sessionId);
-        server.close();
-      };
-
       await server.connect(transport);
-      streamTransports.set(transport.sessionId, transport);
+
+      // handleRequest will assign sessionId on first InitializeRequest
       await transport.handleRequest(req, res);
+
+      // Now store the transport with its assigned sessionId
+      if (transport.sessionId) {
+        streamTransports.set(transport.sessionId, transport);
+        transport.onclose = () => {
+          streamTransports.delete(transport.sessionId);
+          server.close();
+        };
+      }
       return;
     }
 
     if (req.method === "GET") {
-      const sessionId = req.headers["mcp-session-id"];
       if (sessionId && streamTransports.has(sessionId)) {
-        const transport = streamTransports.get(sessionId);
-        await transport.handleRequest(req, res);
+        await streamTransports.get(sessionId).handleRequest(req, res);
         return;
       }
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Missing or invalid session" }));
+      res.writeHead(405);
+      res.end("Method Not Allowed - POST to initialize first");
       return;
     }
 
     if (req.method === "DELETE") {
-      const sessionId = req.headers["mcp-session-id"];
       if (sessionId && streamTransports.has(sessionId)) {
         const transport = streamTransports.get(sessionId);
         await transport.handleRequest(req, res);
         streamTransports.delete(sessionId);
         return;
       }
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Missing or invalid session" }));
+      res.writeHead(404);
+      res.end("Session not found");
       return;
     }
 
