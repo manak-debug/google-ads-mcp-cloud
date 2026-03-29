@@ -10,24 +10,82 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { GoogleAdsApi } from "google-ads-api";
 
-// ── Config ───────────────────────────────────────────
-const e = process.env;
-const CLIENT_ID = e.GOOGLE_ADS_CLIENT_ID;
-const CLIENT_SECRET = e.GOOGLE_ADS_CLIENT_SECRET;
-const DEV_TOKEN = e.GOOGLE_ADS_DEVELOPER_TOKEN;
-const REFRESH_TOKEN = e.GOOGLE_ADS_REFRESH_TOKEN;
-const MCC_ID = (e.GOOGLE_ADS_MCC_ID || "").replace(/-/g, "");
-const PORT = parseInt(e.PORT || "8765");
+// ── Config (read at runtime, not build time) ─────────
+const PORT = parseInt(process.env.PORT || "8765");
 
-if (!CLIENT_ID || !CLIENT_SECRET || !DEV_TOKEN || !REFRESH_TOKEN || !MCC_ID) {
-  console.error("Missing env vars. Set: GOOGLE_ADS_CLIENT_ID, GOOGLE_ADS_CLIENT_SECRET, GOOGLE_ADS_DEVELOPER_TOKEN, GOOGLE_ADS_REFRESH_TOKEN, GOOGLE_ADS_MCC_ID");
-  process.exit(1);
+// Refresh token can be set via env var OR generated via /auth flow
+let dynamicRefreshToken = null;
+
+function getConfig() {
+  const e = process.env;
+  const CLIENT_ID = e.GOOGLE_ADS_CLIENT_ID;
+  const CLIENT_SECRET = e.GOOGLE_ADS_CLIENT_SECRET;
+  const DEV_TOKEN = e.GOOGLE_ADS_DEVELOPER_TOKEN;
+  const REFRESH_TOKEN = dynamicRefreshToken || e.GOOGLE_ADS_REFRESH_TOKEN;
+  const MCC_ID = (e.GOOGLE_ADS_MCC_ID || "").replace(/-/g, "");
+
+  if (!CLIENT_ID || !CLIENT_SECRET || !DEV_TOKEN || !MCC_ID) {
+    const missing = [];
+    if (!CLIENT_ID) missing.push("GOOGLE_ADS_CLIENT_ID");
+    if (!CLIENT_SECRET) missing.push("GOOGLE_ADS_CLIENT_SECRET");
+    if (!DEV_TOKEN) missing.push("GOOGLE_ADS_DEVELOPER_TOKEN");
+    if (!MCC_ID) missing.push("GOOGLE_ADS_MCC_ID");
+    console.error(`Missing required env vars: ${missing.join(", ")}`);
+    process.exit(1);
+  }
+
+  if (!REFRESH_TOKEN) {
+    return { CLIENT_ID, CLIENT_SECRET, DEV_TOKEN, REFRESH_TOKEN: null, MCC_ID, needsAuth: true };
+  }
+
+  return { CLIENT_ID, CLIENT_SECRET, DEV_TOKEN, REFRESH_TOKEN, MCC_ID, needsAuth: false };
 }
 
-const api = new GoogleAdsApi({ client_id: CLIENT_ID, client_secret: CLIENT_SECRET, developer_token: DEV_TOKEN });
+let _config;
+function config() {
+  // Always re-read if we don't have refresh token yet
+  if (!_config || _config.needsAuth) _config = getConfig();
+  return _config;
+}
+
+let _api;
+function getApi() {
+  const c = config();
+  // Recreate API if config changed (new refresh token)
+  if (!_api) {
+    _api = new GoogleAdsApi({ client_id: c.CLIENT_ID, client_secret: c.CLIENT_SECRET, developer_token: c.DEV_TOKEN });
+  }
+  return _api;
+}
+
+// ── OAuth Helper ─────────────────────────────────────
+function getRedirectUri(host) {
+  const proto = host.includes("localhost") ? "http" : "https";
+  return `${proto}://${host}/callback`;
+}
+
+async function exchangeCodeForTokens(code, redirectUri) {
+  const e = process.env;
+  const body = new URLSearchParams({
+    code,
+    client_id: e.GOOGLE_ADS_CLIENT_ID,
+    client_secret: e.GOOGLE_ADS_CLIENT_SECRET,
+    redirect_uri: redirectUri,
+    grant_type: "authorization_code"
+  });
+
+  const resp = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body
+  });
+
+  return await resp.json();
+}
 
 function cust(id) {
-  return api.Customer({ customer_id: (id || MCC_ID).replace(/-/g, ""), refresh_token: REFRESH_TOKEN, login_customer_id: MCC_ID });
+  const c = config();
+  return getApi().Customer({ customer_id: (id || c.MCC_ID).replace(/-/g, ""), refresh_token: c.REFRESH_TOKEN, login_customer_id: c.MCC_ID });
 }
 
 async function q(customerId, query) {
@@ -127,7 +185,7 @@ async function handle(name, a) {
 
   switch (name) {
     case "list_accounts": {
-      const r = await cust(MCC_ID).query(`SELECT customer_client.id, customer_client.descriptive_name, customer_client.status, customer_client.manager, customer_client.currency_code, customer_client.time_zone FROM customer_client WHERE customer_client.status = 'ENABLED' ORDER BY customer_client.descriptive_name`);
+      const r = await cust(config().MCC_ID).query(`SELECT customer_client.id, customer_client.descriptive_name, customer_client.status, customer_client.manager, customer_client.currency_code, customer_client.time_zone FROM customer_client WHERE customer_client.status = 'ENABLED' ORDER BY customer_client.descriptive_name`);
       return { total: r.length, accounts: r.map(x => ({ id: x.customer_client?.id?.toString(), name: x.customer_client?.descriptive_name, status: x.customer_client?.status, is_manager: x.customer_client?.manager, currency: x.customer_client?.currency_code, timezone: x.customer_client?.time_zone })) };
     }
     case "list_campaigns": {
@@ -341,13 +399,89 @@ const httpServer = http.createServer(async (req, res) => {
 
   // Health check
   if (url.pathname === "/health") {
+    const c = config();
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", tools: ALL_TOOLS.length, sessions: transports.size }));
+    res.end(JSON.stringify({ status: "ok", tools: ALL_TOOLS.length, sessions: transports.size, auth: !c.needsAuth ? "connected" : "needs_auth - visit /auth" }));
+    return;
+  }
+
+  // ── OAuth: Step 1 - Redirect to Google ──────────────
+  if (url.pathname === "/auth") {
+    const clientId = process.env.GOOGLE_ADS_CLIENT_ID;
+    if (!clientId) {
+      res.writeHead(500, { "Content-Type": "text/html" });
+      res.end("<h2>Set GOOGLE_ADS_CLIENT_ID env var first</h2>");
+      return;
+    }
+    const redirectUri = getRedirectUri(req.headers.host);
+    const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=https://www.googleapis.com/auth/adwords&access_type=offline&prompt=consent`;
+    res.writeHead(302, { Location: authUrl });
+    res.end();
+    return;
+  }
+
+  // ── OAuth: Step 2 - Handle callback ─────────────────
+  if (url.pathname === "/callback") {
+    const code = url.searchParams.get("code");
+    const error = url.searchParams.get("error");
+
+    if (error) {
+      res.writeHead(400, { "Content-Type": "text/html" });
+      res.end(`<h2>Auth failed: ${error}</h2><p><a href="/auth">Try again</a></p>`);
+      return;
+    }
+
+    if (!code) {
+      res.writeHead(400, { "Content-Type": "text/html" });
+      res.end("<h2>No code received</h2><p><a href='/auth'>Try again</a></p>");
+      return;
+    }
+
+    try {
+      const redirectUri = getRedirectUri(req.headers.host);
+      const tokens = await exchangeCodeForTokens(code, redirectUri);
+
+      if (tokens.error) {
+        res.writeHead(400, { "Content-Type": "text/html" });
+        res.end(`<h2>Token error: ${tokens.error}</h2><p>${tokens.error_description || ""}</p><p><a href="/auth">Try again</a></p>`);
+        return;
+      }
+
+      if (tokens.refresh_token) {
+        // Store refresh token in memory - server is now ready
+        dynamicRefreshToken = tokens.refresh_token;
+        _config = null; // Reset config to pick up new token
+
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end(`
+          <h2>Google Ads MCP Server - Connected!</h2>
+          <p>Refresh token generated and active. Server is ready to use.</p>
+          <h3>For permanent setup, add this env var to Railway:</h3>
+          <pre style="background:#f0f0f0;padding:15px;border-radius:8px;word-break:break-all;max-width:800px;">GOOGLE_ADS_REFRESH_TOKEN=${tokens.refresh_token}</pre>
+          <p><b>Next step:</b> Add <code>https://${req.headers.host}/sse</code> as MCP server in claude.ai</p>
+          <p><a href="/health">Check health</a></p>
+        `);
+      } else {
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end(`<h2>No refresh token received</h2><p>Google didn't return a refresh token. This happens if you already authorized before.</p><p><a href="/auth">Try again</a> (will force re-consent)</p>`);
+      }
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "text/html" });
+      res.end(`<h2>Error: ${err.message}</h2><p><a href="/auth">Try again</a></p>`);
+    }
     return;
   }
 
   // SSE endpoint - client connects here for Server-Sent Events
   if (url.pathname === "/sse") {
+    // Check if auth is done
+    const c = config();
+    if (c.needsAuth) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Not authenticated. Visit /auth first to connect Google Ads account." }));
+      return;
+    }
+
     const transport = new SSEServerTransport("/messages", res);
     const server = createMCPServer();
 
@@ -378,18 +512,26 @@ const httpServer = http.createServer(async (req, res) => {
 
   // Root - info page
   if (url.pathname === "/") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      name: "Google Ads MCP Server",
-      version: "1.0.0",
-      tools: ALL_TOOLS.length,
-      endpoints: {
-        sse: "/sse",
-        messages: "/messages",
-        health: "/health"
-      },
-      usage: "Connect via claude.ai -> Settings -> MCP Servers -> Add URL: https://YOUR_HOST/sse"
-    }));
+    const hasRefresh = !!(dynamicRefreshToken || process.env.GOOGLE_ADS_REFRESH_TOKEN);
+    res.writeHead(200, { "Content-Type": "text/html" });
+    res.end(`
+      <h2>Google Ads MCP Server</h2>
+      <p><b>Status:</b> ${hasRefresh ? "Ready" : "Needs auth - <a href='/auth'>Click here to connect Google Ads</a>"}</p>
+      <p><b>Tools:</b> ${ALL_TOOLS.length}</p>
+      <h3>Endpoints:</h3>
+      <ul>
+        <li><a href="/auth">/auth</a> - Connect Google Ads account (auto-generates refresh token)</li>
+        <li><a href="/health">/health</a> - Health check</li>
+        <li>/sse - MCP SSE endpoint (for claude.ai)</li>
+        <li>/messages - MCP messages endpoint</li>
+      </ul>
+      <h3>Setup:</h3>
+      <ol>
+        <li>Set env vars: GOOGLE_ADS_CLIENT_ID, GOOGLE_ADS_CLIENT_SECRET, GOOGLE_ADS_DEVELOPER_TOKEN, GOOGLE_ADS_MCC_ID</li>
+        <li>Visit <a href="/auth">/auth</a> to connect Google account (auto-generates refresh token)</li>
+        <li>Add <code>https://${req.headers.host}/sse</code> as MCP server in claude.ai</li>
+      </ol>
+    `);
     return;
   }
 
@@ -398,7 +540,13 @@ const httpServer = http.createServer(async (req, res) => {
 });
 
 httpServer.listen(PORT, () => {
+  const hasRefresh = !!(process.env.GOOGLE_ADS_REFRESH_TOKEN);
   console.log(`Google Ads MCP Server (Cloud) running on port ${PORT}`);
   console.log(`SSE endpoint: http://localhost:${PORT}/sse`);
   console.log(`Health check: http://localhost:${PORT}/health`);
+  if (!hasRefresh) {
+    console.log(`\nNo GOOGLE_ADS_REFRESH_TOKEN set.`);
+    console.log(`Visit http://localhost:${PORT}/auth to connect Google Ads account.`);
+    console.log(`Make sure to add your deployed URL + /callback as redirect URI in Google Cloud Console.`);
+  }
 });
