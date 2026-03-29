@@ -4,9 +4,11 @@
  * Connect via claude.ai MCP integration
  */
 
+import crypto from "crypto";
 import http from "http";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { GoogleAdsApi } from "google-ads-api";
 
@@ -363,11 +365,10 @@ async function handle(name, a) {
 }
 
 // ══════════════════════════════════════════════════════
-//  SSE SERVER FOR CLOUD DEPLOYMENT
+//  MCP SERVER (SSE + Streamable HTTP)
 // ══════════════════════════════════════════════════════
 
-function createMCPServer() {
-  const srv = new Server({ name: "google-ads-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+function setupHandlers(srv) {
   srv.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: ALL_TOOLS }));
   srv.setRequestHandler(CallToolRequestSchema, async (req) => {
     try {
@@ -380,14 +381,26 @@ function createMCPServer() {
   return srv;
 }
 
-// Track active transports by session ID
-const transports = new Map();
+// Track active SSE transports
+const sseTransports = new Map();
+// Track active Streamable HTTP transports
+const streamTransports = new Map();
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", chunk => body += chunk);
+    req.on("end", () => resolve(body));
+    req.on("error", reject);
+  });
+}
 
 const httpServer = http.createServer(async (req, res) => {
   // CORS headers for claude.ai
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id");
+  res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
 
   if (req.method === "OPTIONS") {
     res.writeHead(204);
@@ -401,7 +414,7 @@ const httpServer = http.createServer(async (req, res) => {
   if (url.pathname === "/health") {
     const c = config();
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", tools: ALL_TOOLS.length, sessions: transports.size, auth: !c.needsAuth ? "connected" : "needs_auth - visit /auth" }));
+    res.end(JSON.stringify({ status: "ok", tools: ALL_TOOLS.length, sse_sessions: sseTransports.size, stream_sessions: streamTransports.size, auth: !c.needsAuth ? "connected" : "needs_auth - visit /auth" }));
     return;
   }
 
@@ -448,9 +461,8 @@ const httpServer = http.createServer(async (req, res) => {
       }
 
       if (tokens.refresh_token) {
-        // Store refresh token in memory - server is now ready
         dynamicRefreshToken = tokens.refresh_token;
-        _config = null; // Reset config to pick up new token
+        _config = null;
 
         res.writeHead(200, { "Content-Type": "text/html" });
         res.end(`
@@ -458,7 +470,8 @@ const httpServer = http.createServer(async (req, res) => {
           <p>Refresh token generated and active. Server is ready to use.</p>
           <h3>For permanent setup, add this env var to Railway:</h3>
           <pre style="background:#f0f0f0;padding:15px;border-radius:8px;word-break:break-all;max-width:800px;">GOOGLE_ADS_REFRESH_TOKEN=${tokens.refresh_token}</pre>
-          <p><b>Next step:</b> Add <code>https://${req.headers.host}/sse</code> as MCP server in claude.ai</p>
+          <p><b>Next step:</b> Add MCP server URL in claude.ai:</p>
+          <pre style="background:#f0f0f0;padding:15px;border-radius:8px;">https://${req.headers.host}/sse</pre>
           <p><a href="/health">Check health</a></p>
         `);
       } else {
@@ -472,33 +485,98 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // SSE endpoint - client connects here for Server-Sent Events
-  if (url.pathname === "/sse") {
-    // Check if auth is done
+  // ── Streamable HTTP endpoint (POST /mcp) ────────────
+  if (url.pathname === "/mcp") {
     const c = config();
     if (c.needsAuth) {
       res.writeHead(503, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Not authenticated. Visit /auth first to connect Google Ads account." }));
+      res.end(JSON.stringify({ error: "Not authenticated. Visit /auth first." }));
+      return;
+    }
+
+    if (req.method === "POST") {
+      const sessionId = req.headers["mcp-session-id"];
+
+      // Existing session
+      if (sessionId && streamTransports.has(sessionId)) {
+        const transport = streamTransports.get(sessionId);
+        await transport.handleRequest(req, res);
+        return;
+      }
+
+      // New session - create transport and server
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID() });
+      const server = new Server({ name: "google-ads-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+      setupHandlers(server);
+
+      transport.onclose = () => {
+        if (transport.sessionId) streamTransports.delete(transport.sessionId);
+        server.close();
+      };
+
+      await server.connect(transport);
+      streamTransports.set(transport.sessionId, transport);
+      await transport.handleRequest(req, res);
+      return;
+    }
+
+    if (req.method === "GET") {
+      const sessionId = req.headers["mcp-session-id"];
+      if (sessionId && streamTransports.has(sessionId)) {
+        const transport = streamTransports.get(sessionId);
+        await transport.handleRequest(req, res);
+        return;
+      }
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing or invalid session" }));
+      return;
+    }
+
+    if (req.method === "DELETE") {
+      const sessionId = req.headers["mcp-session-id"];
+      if (sessionId && streamTransports.has(sessionId)) {
+        const transport = streamTransports.get(sessionId);
+        await transport.handleRequest(req, res);
+        streamTransports.delete(sessionId);
+        return;
+      }
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing or invalid session" }));
+      return;
+    }
+
+    res.writeHead(405);
+    res.end("Method not allowed");
+    return;
+  }
+
+  // ── SSE endpoint (legacy, also works) ───────────────
+  if (url.pathname === "/sse") {
+    const c = config();
+    if (c.needsAuth) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Not authenticated. Visit /auth first." }));
       return;
     }
 
     const transport = new SSEServerTransport("/messages", res);
-    const server = createMCPServer();
+    const server = new Server({ name: "google-ads-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+    setupHandlers(server);
 
-    transports.set(transport.sessionId, { transport, server });
+    sseTransports.set(transport.sessionId, { transport, server });
 
     res.on("close", () => {
-      transports.delete(transport.sessionId);
+      sseTransports.delete(transport.sessionId);
     });
 
     await server.connect(transport);
     return;
   }
 
-  // Messages endpoint - client sends JSON-RPC messages here
+  // Messages endpoint for SSE
   if (url.pathname === "/messages") {
     const sessionId = url.searchParams.get("sessionId");
-    const session = transports.get(sessionId);
+    const session = sseTransports.get(sessionId);
 
     if (!session) {
       res.writeHead(400, { "Content-Type": "application/json" });
@@ -518,19 +596,17 @@ const httpServer = http.createServer(async (req, res) => {
       <h2>Google Ads MCP Server</h2>
       <p><b>Status:</b> ${hasRefresh ? "Ready" : "Needs auth - <a href='/auth'>Click here to connect Google Ads</a>"}</p>
       <p><b>Tools:</b> ${ALL_TOOLS.length}</p>
-      <h3>Endpoints:</h3>
+      <h3>Connect to claude.ai:</h3>
+      <p>Use any of these URLs:</p>
       <ul>
-        <li><a href="/auth">/auth</a> - Connect Google Ads account (auto-generates refresh token)</li>
-        <li><a href="/health">/health</a> - Health check</li>
-        <li>/sse - MCP SSE endpoint (for claude.ai)</li>
-        <li>/messages - MCP messages endpoint</li>
+        <li><code>https://${req.headers.host}/mcp</code> (Streamable HTTP - recommended)</li>
+        <li><code>https://${req.headers.host}/sse</code> (SSE - legacy)</li>
       </ul>
-      <h3>Setup:</h3>
-      <ol>
-        <li>Set env vars: GOOGLE_ADS_CLIENT_ID, GOOGLE_ADS_CLIENT_SECRET, GOOGLE_ADS_DEVELOPER_TOKEN, GOOGLE_ADS_MCC_ID</li>
-        <li>Visit <a href="/auth">/auth</a> to connect Google account (auto-generates refresh token)</li>
-        <li>Add <code>https://${req.headers.host}/sse</code> as MCP server in claude.ai</li>
-      </ol>
+      <h3>Other endpoints:</h3>
+      <ul>
+        <li><a href="/auth">/auth</a> - Connect Google Ads account</li>
+        <li><a href="/health">/health</a> - Health check</li>
+      </ul>
     `);
     return;
   }
@@ -540,13 +616,8 @@ const httpServer = http.createServer(async (req, res) => {
 });
 
 httpServer.listen(PORT, () => {
-  const hasRefresh = !!(process.env.GOOGLE_ADS_REFRESH_TOKEN);
-  console.log(`Google Ads MCP Server (Cloud) running on port ${PORT}`);
-  console.log(`SSE endpoint: http://localhost:${PORT}/sse`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  if (!hasRefresh) {
-    console.log(`\nNo GOOGLE_ADS_REFRESH_TOKEN set.`);
-    console.log(`Visit http://localhost:${PORT}/auth to connect Google Ads account.`);
-    console.log(`Make sure to add your deployed URL + /callback as redirect URI in Google Cloud Console.`);
-  }
+  console.log(`Google Ads MCP Server running on port ${PORT}`);
+  console.log(`Streamable HTTP: http://localhost:${PORT}/mcp`);
+  console.log(`SSE endpoint:    http://localhost:${PORT}/sse`);
+  console.log(`Health check:    http://localhost:${PORT}/health`);
 });
