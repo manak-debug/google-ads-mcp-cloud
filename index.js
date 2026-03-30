@@ -128,6 +128,8 @@ const READ_TOOLS = [
   t("get_bidding_strategy_details", "Bidding strategy config per campaign", { ...pCid, ...pCamp }, ["customer_id"]),
   t("get_change_history", "Recent account changes audit", { ...pCid, ...pDays }, ["customer_id"]),
   t("run_gaql_query", "Run custom GAQL query", { ...pCid, query: { type: "string", description: "GAQL query" } }, ["customer_id", "query"]),
+  t("get_location_targets", "Get current location targets (countries/cities) for a campaign", { ...pCid, ...pCamp }, ["customer_id", "campaign_id"]),
+  t("search_geo_target", "Search for Google Ads geo target location IDs by name (country, city, state). Use this to find location criterion IDs before setting targets.", { ...pCid, location_name: { type: "string", description: "Location name to search (e.g. India, Mumbai, California)" } }, ["customer_id", "location_name"]),
 ];
 
 const WRITE_TOOLS = [
@@ -149,6 +151,8 @@ const WRITE_TOOLS = [
   t("update_keyword_bid", "Update keyword CPC bid", { ...pCid, ...pAg, criterion_id: { type: "string" }, cpc_bid: { type: "number" } }, ["customer_id", "ad_group_id", "criterion_id", "cpc_bid"]),
   t("remove_ad", "Delete an ad", { ...pCid, ...pAg, ad_id: { type: "string" } }, ["customer_id", "ad_group_id", "ad_id"]),
   t("add_sitelinks", "Add sitelink extensions to campaign", { ...pCid, ...pCamp, sitelinks: { type: "array", items: { type: "object", properties: { text: { type: "string" }, final_url: { type: "string" }, description1: { type: "string" }, description2: { type: "string" } }, required: ["text", "final_url"] } } }, ["customer_id", "campaign_id", "sitelinks"]),
+  t("set_location_targets", "Set target locations (countries/cities) for a campaign. Use search_geo_target first to find location IDs.", { ...pCid, ...pCamp, locations: { type: "array", description: "Array of location targets", items: { type: "object", properties: { location_id: { type: "string", description: "Geo target criterion ID (e.g. 2356 for India, 1007768 for Mumbai)" }, bid_modifier: { type: "number", description: "Bid adjustment multiplier (e.g. 1.2 for +20%, 0.8 for -20%). Optional." } }, required: ["location_id"] } } }, ["customer_id", "campaign_id", "locations"]),
+  t("remove_location_targets", "Remove location targets from a campaign", { ...pCid, ...pCamp, criterion_ids: { type: "array", description: "Array of criterion IDs to remove", items: { type: "string" } } }, ["customer_id", "campaign_id", "criterion_ids"]),
 ];
 
 const ALL_TOOLS = [...READ_TOOLS, ...WRITE_TOOLS];
@@ -266,6 +270,31 @@ async function handle(name, a) {
       const r = await q(cid, a.query);
       return { total: r.length, results: r };
     }
+    case "get_location_targets": {
+      const r = await q(cid, `SELECT campaign_criterion.criterion_id, campaign_criterion.location.geo_target_constant, campaign_criterion.bid_modifier, campaign_criterion.negative FROM campaign_criterion WHERE campaign.id = ${a.campaign_id} AND campaign_criterion.type = 'LOCATION'`);
+      const locations = [];
+      for (const x of r) {
+        const geoConstant = x.campaign_criterion?.location?.geo_target_constant;
+        let locInfo = { criterion_id: x.campaign_criterion?.criterion_id?.toString(), geo_target: geoConstant, bid_modifier: x.campaign_criterion?.bid_modifier, negative: x.campaign_criterion?.negative };
+        if (geoConstant) {
+          try {
+            const geo = await q(cid, `SELECT geo_target_constant.name, geo_target_constant.country_code, geo_target_constant.target_type, geo_target_constant.canonical_name FROM geo_target_constant WHERE geo_target_constant.resource_name = '${geoConstant}'`);
+            if (geo.length) {
+              locInfo.name = geo[0].geo_target_constant?.name;
+              locInfo.country_code = geo[0].geo_target_constant?.country_code;
+              locInfo.type = geo[0].geo_target_constant?.target_type;
+              locInfo.full_name = geo[0].geo_target_constant?.canonical_name;
+            }
+          } catch (e) { /* geo lookup failed, skip */ }
+        }
+        locations.push(locInfo);
+      }
+      return { campaign_id: a.campaign_id, total: locations.length, locations };
+    }
+    case "search_geo_target": {
+      const r = await q(cid, `SELECT geo_target_constant.id, geo_target_constant.name, geo_target_constant.country_code, geo_target_constant.target_type, geo_target_constant.canonical_name, geo_target_constant.status FROM geo_target_constant WHERE geo_target_constant.name LIKE '%${a.location_name}%' AND geo_target_constant.status = 'ENABLED' LIMIT 20`);
+      return { total: r.length, locations: r.map(x => ({ id: x.geo_target_constant?.id?.toString(), name: x.geo_target_constant?.name, country_code: x.geo_target_constant?.country_code, type: x.geo_target_constant?.target_type, full_name: x.geo_target_constant?.canonical_name })) };
+    }
     case "create_search_campaign": {
       const bud = await customer.campaignBudgets.create([{ name: `${a.name} Budget`, amount_micros: mic(a.daily_budget), delivery_method: "STANDARD" }]);
       const cfg = { name: a.name, status: "PAUSED", advertising_channel_type: "SEARCH", campaign_budget: bud.results[0].resource_name, network_settings: { target_google_search: true, target_search_network: true, target_content_network: false } };
@@ -353,6 +382,21 @@ async function handle(name, a) {
     case "remove_ad": {
       const r = await customer.ads.remove([`customers/${cleanId}/adGroupAds/${a.ad_group_id}~${a.ad_id}`]);
       return { success: true, message: `Ad removed`, result: r };
+    }
+    case "set_location_targets": {
+      const r = await customer.campaignCriteria.create(a.locations.map(loc => {
+        const criteria = {
+          campaign: `customers/${cleanId}/campaigns/${a.campaign_id}`,
+          location: { geo_target_constant: `geoTargetConstants/${loc.location_id}` }
+        };
+        if (loc.bid_modifier) criteria.bid_modifier = loc.bid_modifier;
+        return criteria;
+      }));
+      return { success: true, message: `${a.locations.length} location targets added`, result: r };
+    }
+    case "remove_location_targets": {
+      const r = await customer.campaignCriteria.remove(a.criterion_ids.map(id => `customers/${cleanId}/campaignCriteria/${a.campaign_id}~${id}`));
+      return { success: true, message: `${a.criterion_ids.length} location targets removed`, result: r };
     }
     case "add_sitelinks": {
       const assets = await customer.assets.create(a.sitelinks.map(s => ({ sitelink_asset: { link_text: s.text, description1: s.description1 || "", description2: s.description2 || "" }, final_urls: [s.final_url] })));
