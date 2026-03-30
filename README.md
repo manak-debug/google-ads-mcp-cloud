@@ -2,7 +2,7 @@
 
 Deploy to any Node.js hosting (Railway, Render, Fly.io, etc.) and connect via **claude.ai**.
 
-36 tools: 18 read + 18 write for full Google Ads management.
+40 tools: 20 read + 20 write for full Google Ads management.
 
 ## Quick Start
 
@@ -99,15 +99,15 @@ fly deploy
 | `/health` | Health check |
 | `/` | Server info |
 
-## 36 Tools
+## 40 Tools
 
-**READ (18):** list_accounts, list_campaigns, campaign_performance, ad_group_performance, keyword_performance, ad_performance, search_terms_report, get_campaign_structure, get_ad_group_ads, get_geo_performance, get_device_performance, get_age_gender_performance, get_quality_scores, get_conversion_actions, get_campaign_budget_details, get_bidding_strategy_details, get_change_history, run_gaql_query
+**READ (20):** list_accounts, list_campaigns, campaign_performance, ad_group_performance, keyword_performance, ad_performance, search_terms_report, get_campaign_structure, get_ad_group_ads, get_geo_performance, get_device_performance, get_age_gender_performance, get_quality_scores, get_conversion_actions, get_campaign_budget_details, get_bidding_strategy_details, get_change_history, run_gaql_query, get_location_targets, search_geo_target
 
-**WRITE (18):** create_search_campaign, create_pmax_campaign, create_ad_group, create_responsive_search_ad, add_keywords, add_negative_keywords, remove_keywords, remove_negative_keywords, update_campaign_status, update_campaign_budget, update_campaign_name, update_bidding_strategy, update_ad_group_status, update_ad_group_bid, update_keyword_status, update_keyword_bid, remove_ad, add_sitelinks
+**WRITE (20):** create_search_campaign, create_pmax_campaign, create_ad_group, create_responsive_search_ad, add_keywords, add_negative_keywords, remove_keywords, remove_negative_keywords, update_campaign_status, update_campaign_budget, update_campaign_name, update_bidding_strategy, update_ad_group_status, update_ad_group_bid, update_keyword_status, update_keyword_bid, remove_ad, add_sitelinks, set_location_targets, remove_location_targets
 
 ## Health Check
 
 ```bash
 curl https://YOUR_APP.HOST/health
-# {"status":"ok","tools":36,"sessions":0}
+# {"status":"ok","tools":40,"sessions":0}
 ```
